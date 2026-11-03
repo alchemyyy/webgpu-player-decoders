@@ -1,0 +1,164 @@
+# Builds every decoder package, and publishes them as a GitHub release when run by hand on main with a version (Actions > Release > Run workflow).
+# The projects build only inside a WebGPU Player checkout, so the job checks out the engine, puts this repository at its wgpud/, and runs the
+# engine's own steps: make -C wgpud sources, npm run decoders, which loads every package with the engine's loader, and make -C wgpud source-archives.
+# Without a version the run is a dry run, which builds the release files and keeps them as the run's artifact.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, three parts without a leading v, such as 0.2.0; empty for a dry run
+        required: false
+        type: string
+      engine-ref:
+        description: The WebGPU Player branch, tag, or commit whose build steps build the packages
+        required: true
+        default: overhaul
+        type: string
+
+permissions:
+  contents: read
+
+# One release at a time
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ENGINE_REPOSITORY: alchemyyy/WebGPU-Player
+  RELEASE_NAME: WebGPU Player decoders
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # Creates the release and its tag
+    permissions:
+      contents: write
+    # NOTE: Scripts read the inputs from the environment only, because ${{ }} inside a script would splice them into shell code
+    env:
+      VERSION: ${{ inputs.version }}
+      ENGINE_REF: ${{ inputs.engine-ref }}
+      GH_TOKEN: ${{ github.token }}
+      # The working directory is the engine's checkout, so gh would otherwise take the engine's repository from its remote
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # The release tag names the commit that was built, which only main may be
+      - name: Check the version
+        if: env.VERSION != ''
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The version is three numbers without a leading v, not $VERSION"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::Run the release on main, not $GITHUB_REF_NAME"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "refs/tags/v$VERSION" > /dev/null; then
+            echo "::error::v$VERSION already exists"
+            exit 1
+          fi
+          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
+
+      # The codec sources are the engine's submodules, which make -C wgpud sources fetches at their pinned commits
+      - name: Check out the engine
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.ENGINE_REPOSITORY }}
+          ref: ${{ env.ENGINE_REF }}
+
+      # The engine names its folders in tools/constants.json
+      - name: Read the engine layout
+        run: |
+          layout() {
+            node -p 'require(process.argv[1])[process.argv[2]]' "$PWD/tools/constants.json" "$1"
+          }
+          {
+            echo "ENGINE_COMMIT=$(git rev-parse HEAD)"
+            echo "WASM_DIRECTORY=$(layout wasmDirectory)"
+            echo "DECODERS_DIRECTORY=$(layout decodersDirectory)"
+            echo "DECODER_BUILD_DIRECTORY=$(layout decoderBuildDirectory)"
+            echo "DECODER_OUTPUT_DIRECTORY=$(layout decoderOutputDirectory)"
+          } >> "$GITHUB_ENV"
+
+      # In place of the engine's own wgpud/, which holds this repository as a submodule
+      - name: Check out the decoder projects
+        uses: actions/checkout@v7
+        with:
+          path: ${{ env.DECODERS_DIRECTORY }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      # The package build bundles the engine's loader with esbuild to check every package
+      - name: Install the engine's npm packages
+        run: npm ci
+
+      # Both installs are mostly downloads, so Rust installs in the background while Emscripten does.
+      # Every crate pins the same Rust, and rustup installs are not safe side by side, so the crates' toolchains install one after another.
+      # make -C wasm emsdk clones emsdk at the pinned Emscripten into the engine's bin/emsdk/, which the Makefiles use without EMSDK
+      - name: Install the pinned Emscripten and Rust toolchains
+        run: |
+          (
+            for toolchain_file in "$DECODERS_DIRECTORY"/*/*/rust-toolchain.toml; do
+              (cd "$(dirname "$toolchain_file")" && rustup toolchain install --no-self-update) || exit 1
+            done
+          ) &
+          rust_install_process_id=$!
+          make -C "$WASM_DIRECTORY" emsdk
+          wait "$rust_install_process_id"
+
+      - name: Fetch the pinned FFmpeg, dcadec, and libaom
+        run: make -C "$DECODERS_DIRECTORY" sources
+
+      - name: Build the decoder packages
+        run: npm run decoders
+
+      - name: Write the corresponding source of the LGPL packages
+        run: make -C "$DECODERS_DIRECTORY" source-archives
+
+      - name: Collect the release files
+        run: |
+          release_directory="$RUNNER_TEMP/release"
+          mkdir -p "$release_directory"
+          cp "$DECODER_OUTPUT_DIRECTORY"/*.wasm "$DECODERS_DIRECTORY"/licenses/* \
+            "$DECODER_BUILD_DIRECTORY"/source-archives/*.tar.gz "$release_directory"/
+          (cd "$release_directory" && sha256sum -- * > SHA256SUMS)
+          {
+            echo "Built from $GITHUB_REPOSITORY@$GITHUB_SHA with $ENGINE_REPOSITORY@$ENGINE_COMMIT."
+            echo
+            echo '| Package | Bytes | SHA-256 |'
+            echo '| --- | ---: | --- |'
+            for package_file in "$release_directory"/*.wasm; do
+              file_name="${package_file##*/}"
+              echo "| \`$file_name\` | $(stat -c %s "$package_file") | \`$(sha256sum "$package_file" | cut -d ' ' -f 1)\` |"
+            done
+            echo
+            echo 'The packages that contain FFmpeg or libdcadec are LGPL-2.1-or-later.'
+            echo 'The `ffmpeg-`, `dcadec-`, and `webgpu-player-decoders-` archives are their corresponding source, and the license texts are attached.'
+            echo '`SHA256SUMS` lists the SHA-256 of every file.'
+          } > "$RUNNER_TEMP/release-notes.md"
+          cat "$RUNNER_TEMP/release-notes.md"
+          echo "RELEASE_DIRECTORY=$release_directory" >> "$GITHUB_ENV"
+
+      - name: Keep the release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: webgpu-player-decoders
+          path: ${{ env.RELEASE_DIRECTORY }}
+          if-no-files-found: error
+
+      - name: Publish the GitHub release
+        if: env.VERSION != ''
+        run: |
+          gh release create "$TAG" "$RELEASE_DIRECTORY"/* --target "$GITHUB_SHA" \
+            --title "$RELEASE_NAME $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md"

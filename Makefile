@@ -26,17 +26,18 @@ sources:
 	$(call require_commit,$(DCADEC_SUBMODULE),$(DCADEC_COMMIT))
 	$(call require_commit,$(AOM_SUBMODULE),$(AOM_COMMIT))
 
-# The release attaches these as the corresponding source of the LGPL modules: the exact FFmpeg and dcadec trees, and the decoder projects
+# The release attaches these as the corresponding source of the LGPL modules: the exact FFmpeg and dcadec trees, and this
+# repository's decoder projects at its checked-out commit
 source-archives: sources
 	mkdir -p $(ARCHIVES)
 	git -C $(FFMPEG_SUBMODULE) -c core.autocrlf=false archive --format=tar.gz \
 		--prefix=ffmpeg-$(FFMPEG_COMMIT)/ -o $(ARCHIVES)/ffmpeg-$(FFMPEG_COMMIT).tar.gz $(FFMPEG_COMMIT)
 	git -C $(DCADEC_SUBMODULE) -c core.autocrlf=false archive --format=tar.gz \
 		--prefix=dcadec-$(DCADEC_COMMIT)/ -o $(ARCHIVES)/dcadec-$(DCADEC_COMMIT).tar.gz $(DCADEC_COMMIT)
-	revision=$$(git -C $(ENGINE) rev-parse --short=12 HEAD) && \
-		git -C $(ENGINE) -c core.autocrlf=false archive --format=tar.gz \
-			--prefix=webgpu-player-wgpud-$$revision/ \
-			-o $(ARCHIVES)/webgpu-player-wgpud-$$revision.tar.gz HEAD $(call engine_layout,decodersDirectory)
+	revision=$$(git -C $(DECODERS) rev-parse --short=12 HEAD) && \
+		git -C $(DECODERS) -c core.autocrlf=false archive --format=tar.gz \
+			--prefix=webgpu-player-decoders-$$revision/ \
+			-o $(ARCHIVES)/webgpu-player-decoders-$$revision.tar.gz HEAD
 	ls -l $(ARCHIVES)
 
 # Checks out a source submodule at the commit the engine records, fetching only that commit when it is missing.

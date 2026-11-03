@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# The projects' self-test vectors and media must match their generators byte for byte, so git never converts their line endings
+/*/*.vectors -text
+/*/vectors/** -text
