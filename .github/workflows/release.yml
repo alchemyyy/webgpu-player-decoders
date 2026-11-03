@@ -14,7 +14,7 @@ on:
       engine-ref:
         description: The WebGPU Player branch, tag, or commit whose build steps build the packages
         required: true
-        default: overhaul
+        default: main
         type: string
 
 permissions:
