@@ -147,7 +147,8 @@ jobs:
             echo 'The `ffmpeg-`, `dcadec-`, and `webgpu-player-decoders-` archives are their corresponding source, and the license texts are attached.'
             echo '`SHA256SUMS` lists the SHA-256 of every file.'
           } > "$RUNNER_TEMP/release-notes.md"
-          cat "$RUNNER_TEMP/release-notes.md"
+          # The run's summary shows the notes, so a dry run shows what a release would say
+          tee -a "$GITHUB_STEP_SUMMARY" < "$RUNNER_TEMP/release-notes.md"
           echo "RELEASE_DIRECTORY=$release_directory" >> "$GITHUB_ENV"
 
       - name: Keep the release files
