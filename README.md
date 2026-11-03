@@ -25,6 +25,7 @@ Its book describes them, their build, and the package format, in `docs/src/decod
 
 The projects build only inside an engine checkout: the engine's `scripts/decoder-packages.mjs` packs every project and loads each package with the engine's own loader, and the engine's `vendor/` holds the FFmpeg, dcadec, and libaom sources that `rules.mk` pins.
 They need GNU Make, Git, a POSIX shell (Git Bash on Windows), Node.js 24, Emscripten 4.0.13, rustup, CMake, Perl, and GNU patch, as the engine's `docs/src/setup.md` lists.
+On Windows they need long path support too: the FFmpeg and cargo trees pass 260 characters in a nested checkout, so enable `LongPathsEnabled` and Git's `core.longpaths`, and GNU Make and the MSVC linker that cargo uses must accept long paths.
 From the engine root:
 
 ```sh
