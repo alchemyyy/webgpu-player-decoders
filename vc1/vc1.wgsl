@@ -813,18 +813,6 @@ fn bicubic(mode: u32, a: i32, b: i32, c: i32, d: i32) -> i32 {
     }
 }
 
-// FFmpeg's vc1_mspel_filter: one direction's rounded filter
-fn bicubicRounded(mode: u32, a: i32, b: i32, c: i32, d: i32, rounding: i32) -> i32 {
-    switch (mode) {
-        case 1u, 3u: {
-            return (bicubic(mode, a, b, c, d) + 32 - rounding) >> 6u;
-        }
-        default: {
-            return (bicubic(mode, a, b, c, d) + 8 - rounding) >> 4u;
-        }
-    }
-}
-
 // The motion compensation geometry of a luma operation at one of its pixels
 struct LumaSource {
     x: i32,
@@ -873,61 +861,65 @@ fn lumaPrediction(flags: u32, vector: vec2i, macroblockColumn: u32, macroblockRo
     }
     let baseX = origin.x + pixel.x;
     let baseRow = origin.y + pixel.y * rowStep;
+    // The prediction reads a column of rows per tap, rowStep apart: four taps or rows across a direction a quarter sample mode filters,
+    // FFmpeg's vc1_mspel_mc, and two across a direction half sample bilinear prediction averages, FFmpeg's hpeldsp.
+    // The taps and rows take turns at one fetchReference call, so the pipeline compiles the reference fetch once
+    let horizontalMode = u32(vector.x & 3);
+    let verticalMode = u32(vector.y & 3);
+    let rnd = i32(passRnd);
+    var columnCount = 1;
+    var rowCount = 1;
+    var firstColumn = baseX;
+    var firstRow = baseRow;
     if (passMspel != 0u) {
-        let horizontalMode = u32(vector.x & 3);
-        let verticalMode = u32(vector.y & 3);
-        let rnd = i32(passRnd);
-        if (verticalMode != 0u) {
-            if (horizontalMode != 0u) {
-                let shift = (MSPEL_SHIFT[horizontalMode] + MSPEL_SHIFT[verticalMode]) >> 1u;
-                let rounding = (1 << (shift - 1u)) + rnd - 1;
-                var columns = vec4i(0, 0, 0, 0);
-                for (var tap = 0; tap < 4; tap += 1) {
-                    let column = baseX - 1 + tap;
-                    let a = fetchReference(reference, 0u, column, baseRow - rowStep, bottomField);
-                    let b = fetchReference(reference, 0u, column, baseRow, bottomField);
-                    let c = fetchReference(reference, 0u, column, baseRow + rowStep, bottomField);
-                    let d = fetchReference(reference, 0u, column, baseRow + 2 * rowStep, bottomField);
-                    columns[tap] = wrapInt16((bicubic(verticalMode, a, b, c, d) + rounding) >> shift);
-                }
-                return i32(clipToByte((bicubic(horizontalMode, columns.x, columns.y, columns.z, columns.w) + 64 - rnd) >> 7u));
-            }
-            let a = fetchReference(reference, 0u, baseX, baseRow - rowStep, bottomField);
-            let b = fetchReference(reference, 0u, baseX, baseRow, bottomField);
-            let c = fetchReference(reference, 0u, baseX, baseRow + rowStep, bottomField);
-            let d = fetchReference(reference, 0u, baseX, baseRow + 2 * rowStep, bottomField);
-            return i32(clipToByte(bicubicRounded(verticalMode, a, b, c, d, 1 - rnd)));
-        }
         if (horizontalMode != 0u) {
-            let a = fetchReference(reference, 0u, baseX - 1, baseRow, bottomField);
-            let b = fetchReference(reference, 0u, baseX, baseRow, bottomField);
-            let c = fetchReference(reference, 0u, baseX + 1, baseRow, bottomField);
-            let d = fetchReference(reference, 0u, baseX + 2, baseRow, bottomField);
-            return i32(clipToByte(bicubicRounded(horizontalMode, a, b, c, d, rnd)));
+            columnCount = 4;
+            firstColumn = baseX - 1;
         }
-        return fetchReference(reference, 0u, baseX, baseRow, bottomField);
-    }
-    // Half sample bilinear prediction: FFmpeg's hpeldsp, rounding unless RNDCTRL is set
-    let halfX = (vector.x & 2) != 0;
-    let halfY = (vector.y & 2) != 0;
-    let a = fetchReference(reference, 0u, baseX, baseRow, bottomField);
-    if (!halfX && !halfY) {
-        return a;
-    }
-    let noRounding = passRnd != 0u;
-    if (halfX && halfY) {
-        let b = fetchReference(reference, 0u, baseX + 1, baseRow, bottomField);
-        let c = fetchReference(reference, 0u, baseX, baseRow + rowStep, bottomField);
-        let d = fetchReference(reference, 0u, baseX + 1, baseRow + rowStep, bottomField);
-        return (a + b + c + d + select(2, 1, noRounding)) >> 2u;
-    }
-    var b = 0;
-    if (halfX) {
-        b = fetchReference(reference, 0u, baseX + 1, baseRow, bottomField);
+        if (verticalMode != 0u) {
+            rowCount = 4;
+            firstRow = baseRow - rowStep;
+        }
     } else {
-        b = fetchReference(reference, 0u, baseX, baseRow + rowStep, bottomField);
+        columnCount = select(1, 2, (vector.x & 2) != 0);
+        rowCount = select(1, 2, (vector.y & 2) != 0);
     }
-    return (a + b + select(1, 0, noRounding)) >> 1u;
+    // Each tap's column: the quarter sample modes' vertical filter, else the column's own sample, or its rows' sum for bilinear prediction
+    var columns = vec4i(0, 0, 0, 0);
+    for (var tap = 0; tap < columnCount; tap += 1) {
+        var samples = vec4i(0, 0, 0, 0);
+        for (var k = 0; k < rowCount; k += 1) {
+            samples[k] = fetchReference(reference, 0u, firstColumn + tap, firstRow + k * rowStep, bottomField);
+        }
+        var value = samples.x + samples.y;
+        if (passMspel != 0u) {
+            value = samples.x;
+            if (verticalMode != 0u) {
+                // Before a horizontal filter, half the two modes' shifts and kept in int16, as vc1_mspel_mc does; alone, vc1_mspel_filter's
+                // rounded filter. Both round with (1 << (shift - 1)) + rnd - 1
+                let shift = select(select(4u, 6u, verticalMode != 2u), (MSPEL_SHIFT[horizontalMode] + MSPEL_SHIFT[verticalMode]) >> 1u, horizontalMode != 0u);
+                value = (bicubic(verticalMode, samples.x, samples.y, samples.z, samples.w) + (1 << (shift - 1u)) + rnd - 1) >> shift;
+                if (horizontalMode != 0u) {
+                    value = wrapInt16(value);
+                }
+            }
+        }
+        columns[tap] = value;
+    }
+    if (passMspel == 0u) {
+        // The average of one, two, or four samples, rounding unless RNDCTRL is set
+        let shift = u32(columnCount + rowCount - 2);
+        if (shift == 0u) {
+            return columns.x;
+        }
+        return (columns.x + columns.y + (1 << (shift - 1u)) - select(0, 1, passRnd != 0u)) >> shift;
+    }
+    if (horizontalMode == 0u) {
+        return select(columns.x, i32(clipToByte(columns.x)), verticalMode != 0u);
+    }
+    // After a vertical filter, shifted by 7, as vc1_mspel_mc does; alone, vc1_mspel_filter's rounded filter. Both round with (1 << (shift - 1)) - rnd
+    let shift = select(select(4u, 6u, horizontalMode != 2u), 7u, verticalMode != 0u);
+    return i32(clipToByte((bicubic(horizontalMode, columns.x, columns.y, columns.z, columns.w) + (1 << (shift - 1u)) - rnd) >> shift));
 }
 
 fn clipChromaSource(kind: u32, sourceX: i32, sourceY: i32) -> vec2i {
@@ -973,11 +965,14 @@ fn chromaPrediction(flags: u32, vector: vec2i, plane: u32, macroblockColumn: u32
         // mc_4mv_chroma4 applies intensity compensation but not range reduction, which interlaced frames never use
         reference.useIntensityCompensation = reference.useIntensityCompensation;
     }
-    let a = fetchReference(reference, plane, baseX, baseRow, bottomField);
-    let b = fetchReference(reference, plane, baseX + 1, baseRow, bottomField);
-    let c = fetchReference(reference, plane, baseX, baseRow + rowStep, bottomField);
-    let d = fetchReference(reference, plane, baseX + 1, baseRow + rowStep, bottomField);
-    let sum = (8 - fractionX) * (8 - fractionY) * a + fractionX * (8 - fractionY) * b + (8 - fractionX) * fractionY * c + fractionX * fractionY * d;
+    // The four samples take turns at one fetchReference call, so the pipeline compiles the reference fetch once
+    var sum = 0;
+    for (var k = 0u; k < 4u; k += 1u) {
+        let right = (k & 1u) != 0u;
+        let below = k >= 2u;
+        let weight = select(8 - fractionX, fractionX, right) * select(8 - fractionY, fractionY, below);
+        sum += weight * fetchReference(reference, plane, baseX + select(0, 1, right), baseRow + select(0, rowStep, below), bottomField);
+    }
     return (sum + select(32, 28, passRnd != 0u)) >> 6u;
 }
 
@@ -1006,13 +1001,14 @@ fn predictLuma(record: u32, macroblockColumn: u32, macroblockRow: u32, x: u32, y
     if ((putFlags & RECORD_OPERATION_PRESENT) == 0u) {
         return 128;
     }
-    var value = lumaPrediction(putFlags, unpackMotionVector(operationWord(record, M_LUMA_OPS, slot, 1u)), macroblockColumn, macroblockRow, x, y);
-    let averageFlags = operationWord(record, M_LUMA_OPS, slot + 1u, 0u);
-    if ((averageFlags & RECORD_OPERATION_PRESENT) != 0u) {
-        let other = lumaPrediction(averageFlags, unpackMotionVector(operationWord(record, M_LUMA_OPS, slot + 1u, 1u)), macroblockColumn, macroblockRow, x, y);
-        value = (value + other + 1) >> 1u;
+    // The put operation, then the averaging one if present, take turns at one lumaPrediction call
+    let averaged = (operationWord(record, M_LUMA_OPS, slot + 1u, 0u) & RECORD_OPERATION_PRESENT) != 0u;
+    var sum = 0;
+    for (var operation = slot; operation < slot + select(1u, 2u, averaged); operation += 1u) {
+        let vector = unpackMotionVector(operationWord(record, M_LUMA_OPS, operation, 1u));
+        sum += lumaPrediction(operationWord(record, M_LUMA_OPS, operation, 0u), vector, macroblockColumn, macroblockRow, x, y);
     }
-    return value;
+    return select(sum, (sum + 1) >> 1u, averaged);
 }
 
 fn predictChroma(record: u32, plane: u32, macroblockColumn: u32, macroblockRow: u32, x: u32, y: u32) -> i32 {
@@ -1029,13 +1025,14 @@ fn predictChroma(record: u32, plane: u32, macroblockColumn: u32, macroblockRow: 
     if ((putFlags & RECORD_OPERATION_PRESENT) == 0u) {
         return 128;
     }
-    var value = chromaPrediction(putFlags, unpackMotionVector(operationWord(record, M_CHROMA_OPS, slot, 1u)), plane, macroblockColumn, macroblockRow, x, y);
-    let averageFlags = operationWord(record, M_CHROMA_OPS, slot + 1u, 0u);
-    if ((averageFlags & RECORD_OPERATION_PRESENT) != 0u) {
-        let other = chromaPrediction(averageFlags, unpackMotionVector(operationWord(record, M_CHROMA_OPS, slot + 1u, 1u)), plane, macroblockColumn, macroblockRow, x, y);
-        value = (value + other + 1) >> 1u;
+    // The put operation, then the averaging one if present, take turns at one chromaPrediction call
+    let averaged = (operationWord(record, M_CHROMA_OPS, slot + 1u, 0u) & RECORD_OPERATION_PRESENT) != 0u;
+    var sum = 0;
+    for (var operation = slot; operation < slot + select(1u, 2u, averaged); operation += 1u) {
+        let vector = unpackMotionVector(operationWord(record, M_CHROMA_OPS, operation, 1u));
+        sum += chromaPrediction(operationWord(record, M_CHROMA_OPS, operation, 0u), vector, plane, macroblockColumn, macroblockRow, x, y);
     }
-    return value;
+    return select(sum, (sum + 1) >> 1u, averaged);
 }
 
 // The transform half-word of a block
@@ -1284,50 +1281,37 @@ fn transformRow(record: u32, block: u32, row: u32, intra: bool) {
             dcOnlyValues[block * 4u + subblock] = dcOnlyValue(transformType, blockValue(block, row, origin.x));
         }
     }
-    switch (transformType) {
-        case RECORD_TRANSFORM_8X8: {
-            if ((dcOnly & 1u) != 0u) {
-                return;
-            }
-            var samples: array<i32, 8>;
-            for (var column = 0u; column < 8u; column += 1u) {
-                samples[column] = blockValue(block, row, column);
-            }
-            let result = transform8(samples, 4);
-            for (var column = 0u; column < 8u; column += 1u) {
-                setBlockValue(block, row, column, wrapInt16(result[column] >> 3u));
-            }
+    // 8x8 and 8x4 blocks share one 8-point row transform and 4x8 and 4x4 blocks one 4-point one, so each compiles once
+    if (transformType == RECORD_TRANSFORM_8X8 || transformType == RECORD_TRANSFORM_8X4) {
+        // An 8x8 block is its one subblock, which is coded; an 8x4 block's rows split in two
+        let subblock = select(0u, row >> 2u, transformType == RECORD_TRANSFORM_8X4);
+        let codedSubblock = transformType == RECORD_TRANSFORM_8X8 || ((coded >> subblock) & 1u) != 0u;
+        if (!codedSubblock || ((dcOnly >> subblock) & 1u) != 0u) {
+            return;
         }
-        case RECORD_TRANSFORM_8X4: {
-            let subblock = row >> 2u;
-            if (((coded >> subblock) & 1u) == 0u || ((dcOnly >> subblock) & 1u) != 0u) {
-                return;
-            }
-            var samples: array<i32, 8>;
-            for (var column = 0u; column < 8u; column += 1u) {
-                samples[column] = blockValue(block, row, column);
-            }
-            let result = transform8(samples, 4);
-            for (var column = 0u; column < 8u; column += 1u) {
-                setBlockValue(block, row, column, wrapInt16(result[column] >> 3u));
-            }
+        var samples: array<i32, 8>;
+        for (var column = 0u; column < 8u; column += 1u) {
+            samples[column] = blockValue(block, row, column);
         }
-        default: {
-            for (var half = 0u; half < 2u; half += 1u) {
-                var subblock = half;
-                if (transformType == RECORD_TRANSFORM_4X4) {
-                    subblock = (row >> 2u) * 2u + half;
-                }
-                if (((coded >> subblock) & 1u) == 0u || ((dcOnly >> subblock) & 1u) != 0u) {
-                    continue;
-                }
-                let first = half * 4u;
-                let result = transform4(blockValue(block, row, first), blockValue(block, row, first + 1u),
-                    blockValue(block, row, first + 2u), blockValue(block, row, first + 3u), 4);
-                for (var column = 0u; column < 4u; column += 1u) {
-                    setBlockValue(block, row, first + column, wrapInt16(result[column] >> 3u));
-                }
-            }
+        let result = transform8(samples, 4);
+        for (var column = 0u; column < 8u; column += 1u) {
+            setBlockValue(block, row, column, wrapInt16(result[column] >> 3u));
+        }
+        return;
+    }
+    for (var half = 0u; half < 2u; half += 1u) {
+        var subblock = half;
+        if (transformType == RECORD_TRANSFORM_4X4) {
+            subblock = (row >> 2u) * 2u + half;
+        }
+        if (((coded >> subblock) & 1u) == 0u || ((dcOnly >> subblock) & 1u) != 0u) {
+            continue;
+        }
+        let first = half * 4u;
+        let result = transform4(blockValue(block, row, first), blockValue(block, row, first + 1u),
+            blockValue(block, row, first + 2u), blockValue(block, row, first + 3u), 4);
+        for (var column = 0u; column < 4u; column += 1u) {
+            setBlockValue(block, row, first + column, wrapInt16(result[column] >> 3u));
         }
     }
 }
@@ -1372,79 +1356,40 @@ fn transformColumn(record: u32, block: u32, column: u32, intra: bool) {
     let transformType = transform & RECORD_TRANSFORM_TYPE_MASK;
     let coded = (transform >> RECORD_TRANSFORM_CODED_SHIFT) & 15u;
     let dcOnly = select((transform >> RECORD_TRANSFORM_DC_ONLY_SHIFT) & 15u, 0u, intra);
-    switch (transformType) {
-        case RECORD_TRANSFORM_8X8: {
-            if ((dcOnly & 1u) != 0u) {
-                fillColumn(block, column, dcOnlyValues[block * 4u], 0u, 8u);
-                return;
-            }
-            var samples: array<i32, 8>;
-            for (var row = 0u; row < 8u; row += 1u) {
-                samples[row] = blockValue(block, row, column);
-            }
-            let result = transform8(samples, 64);
-            for (var row = 0u; row < 8u; row += 1u) {
-                let rounding = select(0, 1, row >= 4u);
-                setBlockValue(block, row, column, wrapInt16((result[row] + rounding) >> 7u));
-            }
+    // 8x8 and 4x8 blocks share one 8-point column transform and 8x4 and 4x4 blocks one 4-point one, so each compiles once;
+    // a subblock that is not coded fills with 0, and a DC-only one with its DC-only value
+    if (transformType == RECORD_TRANSFORM_8X8 || transformType == RECORD_TRANSFORM_4X8) {
+        // An 8x8 block is its one subblock, which is coded; a 4x8 block's columns split in two
+        let subblock = select(0u, column >> 2u, transformType == RECORD_TRANSFORM_4X8);
+        let codedSubblock = transformType == RECORD_TRANSFORM_8X8 || ((coded >> subblock) & 1u) != 0u;
+        if (!codedSubblock || ((dcOnly >> subblock) & 1u) != 0u) {
+            fillColumn(block, column, select(0, dcOnlyValues[block * 4u + subblock], codedSubblock), 0u, 8u);
+            return;
         }
-        case RECORD_TRANSFORM_8X4: {
-            for (var subblock = 0u; subblock < 2u; subblock += 1u) {
-                let first = subblock * 4u;
-                if (((coded >> subblock) & 1u) == 0u) {
-                    fillColumn(block, column, 0, first, 4u);
-                    continue;
-                }
-                if (((dcOnly >> subblock) & 1u) != 0u) {
-                    fillColumn(block, column, dcOnlyValues[block * 4u + subblock], first, 4u);
-                    continue;
-                }
-                let result = transform4(blockValue(block, first, column), blockValue(block, first + 1u, column),
-                    blockValue(block, first + 2u, column), blockValue(block, first + 3u, column), 64);
-                for (var row = 0u; row < 4u; row += 1u) {
-                    setBlockValue(block, first + row, column, result[row] >> 7u);
-                }
-            }
+        var samples: array<i32, 8>;
+        for (var row = 0u; row < 8u; row += 1u) {
+            samples[row] = blockValue(block, row, column);
         }
-        case RECORD_TRANSFORM_4X8: {
-            let subblock = column >> 2u;
-            if (((coded >> subblock) & 1u) == 0u) {
-                fillColumn(block, column, 0, 0u, 8u);
-                return;
-            }
-            if (((dcOnly >> subblock) & 1u) != 0u) {
-                fillColumn(block, column, dcOnlyValues[block * 4u + subblock], 0u, 8u);
-                return;
-            }
-            var samples: array<i32, 8>;
-            for (var row = 0u; row < 8u; row += 1u) {
-                samples[row] = blockValue(block, row, column);
-            }
-            let result = transform8(samples, 64);
-            for (var row = 0u; row < 8u; row += 1u) {
-                let rounding = select(0, 1, row >= 4u);
-                setBlockValue(block, row, column, (result[row] + rounding) >> 7u);
-            }
+        let result = transform8(samples, 64);
+        let keepsInt16 = transformType == RECORD_TRANSFORM_8X8;
+        for (var row = 0u; row < 8u; row += 1u) {
+            let value = (result[row] + select(0, 1, row >= 4u)) >> 7u;
+            setBlockValue(block, row, column, select(value, wrapInt16(value), keepsInt16));
         }
-        default: {
-            let half = column >> 2u;
-            for (var vertical = 0u; vertical < 2u; vertical += 1u) {
-                let subblock = vertical * 2u + half;
-                let first = vertical * 4u;
-                if (((coded >> subblock) & 1u) == 0u) {
-                    fillColumn(block, column, 0, first, 4u);
-                    continue;
-                }
-                if (((dcOnly >> subblock) & 1u) != 0u) {
-                    fillColumn(block, column, dcOnlyValues[block * 4u + subblock], first, 4u);
-                    continue;
-                }
-                let result = transform4(blockValue(block, first, column), blockValue(block, first + 1u, column),
-                    blockValue(block, first + 2u, column), blockValue(block, first + 3u, column), 64);
-                for (var row = 0u; row < 4u; row += 1u) {
-                    setBlockValue(block, first + row, column, result[row] >> 7u);
-                }
-            }
+        return;
+    }
+    for (var vertical = 0u; vertical < 2u; vertical += 1u) {
+        let subblock = select(vertical, vertical * 2u + (column >> 2u), transformType == RECORD_TRANSFORM_4X4);
+        let first = vertical * 4u;
+        let codedSubblock = ((coded >> subblock) & 1u) != 0u;
+        if (!codedSubblock || ((dcOnly >> subblock) & 1u) != 0u) {
+            fillColumn(block, column, select(0, dcOnlyValues[block * 4u + subblock], codedSubblock), first, 4u);
+            continue;
+        }
+        let result = transform4(blockValue(block, first, column), blockValue(block, first + 1u, column),
+            blockValue(block, first + 2u, column), blockValue(block, first + 3u, column), 64);
+        for (var row = 0u; row < 4u; row += 1u) {
+            setBlockValue(block, first + row, column, result[row] >> 7u);
         }
     }
 }
@@ -1954,27 +1899,23 @@ fn filterLine(plane: u32, horizontalEdge: bool, x: u32, edge: u32, rowStep: u32,
     return true;
 }
 
-// FFmpeg's vc1_loop_filter on one segment of four lines: the third line decides for the others.
-// For a horizontal edge the lines are columns x to x + 3; for a vertical edge they are the pass rows x to x + 3, rowStep apart in the picture
-fn filterSegment(plane: u32, horizontalEdge: bool, first: u32, edge: u32, rowStep: u32, pq: i32) {
-    if (horizontalEdge) {
-        if (filterLine(plane, true, first + 2u, edge, rowStep, pq)) {
-            filterLine(plane, true, first, edge, rowStep, pq);
-            filterLine(plane, true, first + 1u, edge, rowStep, pq);
-            filterLine(plane, true, first + 3u, edge, rowStep, pq);
-        }
-        return;
-    }
-    if (filterLine(plane, false, segmentRow(first, 2u, rowStep), edge, rowStep, pq)) {
-        filterLine(plane, false, segmentRow(first, 0u, rowStep), edge, rowStep, pq);
-        filterLine(plane, false, segmentRow(first, 1u, rowStep), edge, rowStep, pq);
-        filterLine(plane, false, segmentRow(first, 3u, rowStep), edge, rowStep, pq);
-    }
-}
+// The order a segment's lines filter in: the third line first, since it decides for the others
+const SEGMENT_LINE_ORDER = array<u32, 4>(
+    2u, 0u, 1u, 3u
+);
 
-// The picture row of line k of a vertical edge segment starting at a pass row
-fn segmentRow(first: u32, k: u32, rowStep: u32) -> u32 {
-    return pictureRow(first + k * rowStep);
+// FFmpeg's vc1_loop_filter on one segment of four lines: the third line decides for the others.
+// For a horizontal edge the lines are columns first to first + 3; for a vertical edge they are the pass rows first to first + 3, rowStep apart
+// in the picture. The lines take turns at one filterLine call, so each pipeline compiles the line filter once
+fn filterSegment(plane: u32, horizontalEdge: bool, first: u32, edge: u32, rowStep: u32, pq: i32) {
+    for (var index = 0u; index < 4u; index += 1u) {
+        let line = SEGMENT_LINE_ORDER[index];
+        let x = select(pictureRow(first + line * rowStep), first + line, horizontalEdge);
+        let filtered = filterLine(plane, horizontalEdge, x, edge, rowStep, pq);
+        if (index == 0u && !filtered) {
+            return;
+        }
+    }
 }
 
 fn macroblockField(column: u32, row: u32, field: u32) -> u32 {
@@ -2241,6 +2182,17 @@ fn isSplitTransform(transformType: u32, split: u32) -> bool {
     return transformType == RECORD_TT_4X4 || transformType == split;
 }
 
+// Filters a line segment's edges in order along it: bit n of edges is the edge at base + 4n.
+// The edges take turns at one filterSegment call in a loop whose count depends on the edges, so the pipeline compiles the segment filter once
+fn filterSegmentEdges(plane: u32, horizontalEdge: bool, first: u32, base: u32, edges: u32, pq: i32) {
+    var remaining = edges;
+    while (remaining != 0u) {
+        let edge = base + 4u * firstTrailingBit(remaining);
+        remaining &= remaining - 1u;
+        filterSegment(plane, horizontalEdge, first, edge, 2u, pq);
+    }
+}
+
 // The edges across the rows of one 4-column segment and one parity, top to bottom.
 // Invocations take luma segments, then each chroma plane's, each segment twice for the two parities
 fn filterFrameHorizontalEdges(index: u32) {
@@ -2273,55 +2225,41 @@ fn filterFrameHorizontalEdges(index: u32) {
         let topEdge = (flags & RECORD_MACROBLOCK_SLICE_TOP_BIT) != 0u;
         let bottomEdge = (flags & RECORD_MACROBLOCK_SLICE_BOTTOM_BIT) != 0u;
         let fieldTransform = (flags & RECORD_MACROBLOCK_FIELDTX_BIT) != 0u;
+        // Bit n: the edge at base + 4n
+        var base = row * 16u + parity;
+        var edges = 0u;
         if (plane != 0u) {
-            let base = row * 8u + parity;
+            base = row * 8u + parity;
             if (intraPicture) {
-                if (!topEdge) {
-                    filterSegment(plane, true, x, base, 2u, pq);
+                edges = select(1u, 0u, topEdge);
+            } else if (!bottomEdge) {
+                if (!topEdge && isSplitTransform(blockTransformType(column, row, 3u + plane), RECORD_TT_8X4)) {
+                    edges = 2u;
                 }
-                continue;
+                edges |= 4u;
             }
-            if (bottomEdge) {
-                continue;
-            }
-            if (!topEdge && isSplitTransform(blockTransformType(column, row, 3u + plane), RECORD_TT_8X4)) {
-                filterSegment(plane, true, x, base + 4u, 2u, pq);
-            }
-            filterSegment(plane, true, x, base + 8u, 2u, pq);
-            continue;
-        }
-        let base = row * 16u + parity;
-        if (intraPicture) {
-            if (!topEdge) {
-                filterSegment(0u, true, x, base, 2u, pq);
-            }
-            if (!fieldTransform) {
-                filterSegment(0u, true, x, base + 8u, 2u, pq);
-            }
-            continue;
-        }
-        if (fieldTransform) {
+        } else if (intraPicture) {
+            edges = select(1u, 0u, topEdge) | select(4u, 0u, fieldTransform);
+        } else if (fieldTransform) {
             // Block half holds the top field's lines, block half + 2 the bottom field's
             let block = half + 2u * parity;
             if (isSplitTransform(blockTransformType(column, row, block), RECORD_TT_8X4)) {
-                filterSegment(0u, true, x, base + 8u, 2u, pq);
+                edges = 4u;
             }
+            edges |= select(16u, 0u, bottomEdge);
+        } else {
+            if (!topEdge && isSplitTransform(blockTransformType(column, row, half), RECORD_TT_8X4)) {
+                edges = 2u;
+            }
+            edges |= 4u;
             if (!bottomEdge) {
-                filterSegment(0u, true, x, base + 16u, 2u, pq);
+                if (isSplitTransform(blockTransformType(column, row, half + 2u), RECORD_TT_8X4)) {
+                    edges |= 8u;
+                }
+                edges |= 16u;
             }
-            continue;
         }
-        if (!topEdge && isSplitTransform(blockTransformType(column, row, half), RECORD_TT_8X4)) {
-            filterSegment(0u, true, x, base + 4u, 2u, pq);
-        }
-        filterSegment(0u, true, x, base + 8u, 2u, pq);
-        if (bottomEdge) {
-            continue;
-        }
-        if (isSplitTransform(blockTransformType(column, row, half + 2u), RECORD_TT_8X4)) {
-            filterSegment(0u, true, x, base + 12u, 2u, pq);
-        }
-        filterSegment(0u, true, x, base + 16u, 2u, pq);
+        filterSegmentEdges(plane, true, x, base, edges, pq);
     }
 }
 
@@ -2356,39 +2294,31 @@ fn filterFrameVerticalEdges(index: u32) {
     let width = select(16u, 8u, plane != 0u);
     for (var column = 0u; column < mbWidth; column += 1u) {
         let lastColumn = column + 1u >= mbWidth;
-        let left = column * width;
+        // Bit n: the edge at column * width + 4n
+        var edges = 0u;
         if (intraPicture) {
-            if (plane == 0u) {
-                filterSegment(0u, false, firstRow, left + 8u, 2u, pq);
-            }
-            if (!lastColumn) {
-                filterSegment(plane, false, firstRow, left + width, 2u, pq);
-            }
-            continue;
-        }
-        if (plane != 0u) {
+            // The luma internal edge, then the right edge, at bit 4 of a luma macroblock and bit 2 of a chroma one
+            edges = select(0u, 4u, plane == 0u) | select(1u << (width >> 2u), 0u, lastColumn);
+        } else if (plane != 0u) {
             if (isSplitTransform(blockTransformType(column, row, 3u + plane), RECORD_TT_4X8)) {
-                filterSegment(plane, false, firstRow, left + 4u, 2u, pq);
+                edges = 2u;
             }
-            if (!lastColumn) {
-                filterSegment(plane, false, firstRow, left + 8u, 2u, pq);
+            edges |= select(4u, 0u, lastColumn);
+        } else {
+            // Field transform macroblocks hold each field's lines in one block row, frame macroblocks each half's rows
+            let fieldTransform = (macroblockField(column, row, RECORD_MACROBLOCK_FLAGS) & RECORD_MACROBLOCK_FIELDTX_BIT) != 0u;
+            let blockRow = select(lower, parity, fieldTransform);
+            let leftBlock = blockRow * 2u;
+            if (isSplitTransform(blockTransformType(column, row, leftBlock), RECORD_TT_4X8)) {
+                edges = 2u;
             }
-            continue;
+            edges |= 4u;
+            if (isSplitTransform(blockTransformType(column, row, leftBlock + 1u), RECORD_TT_4X8)) {
+                edges |= 8u;
+            }
+            edges |= select(16u, 0u, lastColumn);
         }
-        // Field transform macroblocks hold each field's lines in one block row, frame macroblocks each half's rows
-        let fieldTransform = (macroblockField(column, row, RECORD_MACROBLOCK_FLAGS) & RECORD_MACROBLOCK_FIELDTX_BIT) != 0u;
-        let blockRow = select(lower, parity, fieldTransform);
-        let leftBlock = blockRow * 2u;
-        if (isSplitTransform(blockTransformType(column, row, leftBlock), RECORD_TT_4X8)) {
-            filterSegment(0u, false, firstRow, left + 4u, 2u, pq);
-        }
-        filterSegment(0u, false, firstRow, left + 8u, 2u, pq);
-        if (isSplitTransform(blockTransformType(column, row, leftBlock + 1u), RECORD_TT_4X8)) {
-            filterSegment(0u, false, firstRow, left + 12u, 2u, pq);
-        }
-        if (!lastColumn) {
-            filterSegment(0u, false, firstRow, left + 16u, 2u, pq);
-        }
+        filterSegmentEdges(plane, false, firstRow, column * width, edges, pq);
     }
 }
 
